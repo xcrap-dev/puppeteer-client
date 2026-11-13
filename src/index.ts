@@ -35,6 +35,36 @@ export type ConfigurePageOptions = {
     javaScriptEnabled: PuppeterRequestOptions["javaScriptEnabled"]
 }
 
+export type PageSession = {
+    page: Page
+    close: () => Promise<void>
+}
+
+export type ParsedProxy = {
+    server: string
+    credentials?: { username: string; password: string }
+}
+
+/** Splits `http://user:pass@host:port` into the server Chrome accepts and the credentials. */
+export function parseProxy(proxy: string): ParsedProxy {
+    let url: URL
+
+    try {
+        url = new URL(proxy)
+    } catch {
+        return { server: proxy }
+    }
+
+    if (!url.username) {
+        return { server: proxy }
+    }
+
+    return {
+        server: `${url.protocol}//${url.host}`,
+        credentials: { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) },
+    }
+}
+
 export type PuppeteerFetchManyOptions = ClientFetchManyOptions<PuppeterRequestOptions>
 
 export class PuppeteerClient extends BaseClient<string> implements ClientInterface {
@@ -49,10 +79,6 @@ export class PuppeteerClient extends BaseClient<string> implements ClientInterfa
 
     protected async initBrowser(): Promise<void> {
         const puppeteerArguments: string[] = []
-
-        if (this.proxy) {
-            puppeteerArguments.push(`--proxy-server=${this.currentProxy}`)
-        }
 
         if (this.options.args && this.options.args.length > 0) {
             puppeteerArguments.push(...this.options.args)
@@ -76,6 +102,29 @@ export class PuppeteerClient extends BaseClient<string> implements ClientInterfa
             await this.browser.close()
             this.browser = undefined
         }
+    }
+
+    /**
+     * Opens a page for one request. With a proxy, the page lives in its own browser context
+     * using that proxy, so proxy functions are evaluated on every request.
+     */
+    protected async openPage(): Promise<PageSession> {
+        const proxy = this.currentProxy
+
+        if (!proxy) {
+            const page = await this.browser!.newPage()
+            return { page, close: () => page.close() }
+        }
+
+        const { server, credentials } = parseProxy(proxy)
+        const context = await this.browser!.createBrowserContext({ proxyServer: server })
+        const page = await context.newPage()
+
+        if (credentials) {
+            await page.authenticate(credentials)
+        }
+
+        return { page, close: () => context.close() }
     }
 
     protected async configurePage(page: Page, { javaScriptEnabled }: ConfigurePageOptions): Promise<void> {
@@ -132,7 +181,9 @@ export class PuppeteerClient extends BaseClient<string> implements ClientInterfa
         const failedAttempts: FaliedAttempt[] = []
 
         const attemptRequest = async (currentRetry: number): Promise<HttpResponse> => {
-            let page: Page | undefined = undefined
+            let session: PageSession | undefined
+            let result: HttpResponse | undefined
+            let errorMessage: string
 
             try {
                 const fullUrl = this.currentProxyUrl ? `${this.currentProxyUrl}${url}` : url
@@ -141,56 +192,60 @@ export class PuppeteerClient extends BaseClient<string> implements ClientInterfa
                     before: actionsBeforeRequest,
                     after: actionsAfterRequest
                 } = this.extractActions(actions)
-        
-                page = await this.browser!.newPage()
-        
+
+                session = await this.openPage()
+                const { page } = session
+
                 await this.configurePage(page, { javaScriptEnabled: javaScriptEnabled })
                 await this.executeActions(page, actionsBeforeRequest)
                 const response = await page.goto(fullUrl)
                 await this.executeActions(page, actionsAfterRequest)
                 const content = await page.content()
-                await page.close()
 
-                const status = response?.status()
+                const status = response?.status() ?? 200
 
-                if (status === undefined || !this.isSuccess(status)) {
-                    throw new InvalidStatusCodeError(status ?? 500)
-                }
-
-                return new HttpResponse({
+                result = new HttpResponse({
                     body: content,
                     headers: response?.headers() || {},
-                    status: response?.status() || 200,
-                    statusText: response?.statusText() || "Ok",
+                    status: status,
+                    statusText: response?.statusText() || "",
                     attempts: currentRetry + 1,
                     failedAttempts: failedAttempts,
                 })
+
+                if (this.isSuccess(status)) {
+                    return result
+                }
+
+                errorMessage = new InvalidStatusCodeError(status, fullUrl).message
             } catch (error: any) {
-                const errorMessage = error instanceof Error ? error.message : "Unknown error"
-
-                failedAttempts.push({ error: errorMessage, timestamp: new Date() })
-    
-                if (page) {
-                    await page.close().catch(() => {})
-                }
-    
-                if (currentRetry < maxRetries) {
-                    if (retryDelay !== undefined && retryDelay > 0) {
-                        await delay(retryDelay)
-                    }
-
-                    return await attemptRequest(currentRetry + 1)
-                }
-    
-                return new HttpResponse({
-                    body: errorMessage,
-                    headers: {},
-                    status: error.status || 500,
-                    statusText: "Request Failed",
-                    attempts: currentRetry + 1,
-                    failedAttempts: failedAttempts,
-                })
+                errorMessage = error instanceof Error ? error.message : "Unknown error"
+            } finally {
+                await session?.close().catch(() => {})
             }
+
+            failedAttempts.push({ error: errorMessage, timestamp: new Date() })
+
+            if (currentRetry < maxRetries) {
+                if (retryDelay !== undefined && retryDelay > 0) {
+                    await delay(retryDelay)
+                }
+
+                return await attemptRequest(currentRetry + 1)
+            }
+
+            if (result) {
+                return result
+            }
+
+            return new HttpResponse({
+                body: errorMessage,
+                headers: {},
+                status: 500,
+                statusText: "Request Failed",
+                attempts: currentRetry + 1,
+                failedAttempts: failedAttempts,
+            })
         }
 
         return await attemptRequest(retries)
